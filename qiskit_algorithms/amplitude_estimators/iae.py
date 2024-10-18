@@ -1,6 +1,6 @@
 # This code is part of a Qiskit project.
 #
-# (C) Copyright IBM 2018, 2024.
+# (C) Copyright IBM 2018, 2023.
 #
 # This code is licensed under the Apache License, Version 2.0. You may
 # obtain a copy of this license in the LICENSE.txt file in the root directory
@@ -17,13 +17,16 @@ from typing import cast, Callable, Tuple
 import warnings
 import numpy as np
 from scipy.stats import beta
+import scipy.stats as stats
+from scipy.optimize import minimize
 
-from qiskit import ClassicalRegister, QuantumCircuit
-from qiskit.primitives import BaseSampler, Sampler
+from qiskit import ClassicalRegister, QuantumCircuit, transpile
+from qiskit_ibm_runtime import Sampler, SamplerV2
 
 from .amplitude_estimator import AmplitudeEstimator, AmplitudeEstimatorResult
 from .estimation_problem import EstimationProblem
 from ..exceptions import AlgorithmError
+import time
 
 
 class IterativeAmplitudeEstimation(AmplitudeEstimator):
@@ -47,14 +50,13 @@ class IterativeAmplitudeEstimation(AmplitudeEstimator):
              `arXiv:quant-ph/0005055 <http://arxiv.org/abs/quant-ph/0005055>`_.
     """
 
-    # pylint: disable=too-many-positional-arguments
     def __init__(
         self,
         epsilon_target: float,
         alpha: float,
         confint_method: str = "beta",
         min_ratio: float = 2,
-        sampler: BaseSampler | None = None,
+        sampler: Sampler | None = None,
     ) -> None:
         r"""
         The output of the algorithm is an estimate for the amplitude `a`, that with at least
@@ -98,7 +100,7 @@ class IterativeAmplitudeEstimation(AmplitudeEstimator):
         self._sampler = sampler
 
     @property
-    def sampler(self) -> BaseSampler | None:
+    def sampler(self) -> Sampler | None:
         """Get the sampler primitive.
 
         Returns:
@@ -107,7 +109,7 @@ class IterativeAmplitudeEstimation(AmplitudeEstimator):
         return self._sampler
 
     @sampler.setter
-    def sampler(self, sampler: BaseSampler) -> None:
+    def sampler(self, sampler: Sampler) -> None:
         """Set sampler primitive.
 
         Args:
@@ -160,34 +162,33 @@ class IterativeAmplitudeEstimation(AmplitudeEstimator):
         if min_ratio <= 1:
             raise AlgorithmError("min_ratio must be larger than 1 to ensure convergence")
 
-        # initialize variables
         theta_l, theta_u = theta_interval
         old_scaling = 4 * k + 2  # current scaling factor, called K := (4k + 2)
 
-        # the largest feasible scaling factor K cannot be larger than K_max,
-        # which is bounded by the length of the current confidence interval
+        # Calculate the maximal scaling factor K, limited by the precision of the current interval
         max_scaling = int(1 / (2 * (theta_u - theta_l)))
         scaling = max_scaling - (max_scaling - 2) % 4  # bring into the form 4 * k_max + 2
 
+        # calculate the decrement amount as 10% of the current scaling, rounded down to the nearest multiple of 4
+        decrement = max(4, (old_scaling // 10) - (old_scaling // 10) % 4)
+
         # find the largest feasible scaling factor K_next, and thus k_next
         while scaling >= min_ratio * old_scaling:
-            theta_min = scaling * theta_l - int(scaling * theta_l)
-            theta_max = scaling * theta_u - int(scaling * theta_u)
+            theta_min = (scaling * theta_l) % 1
+            theta_max = (scaling * theta_u) % 1
 
-            if theta_min <= theta_max <= 0.5 and theta_min <= 0.5:
-                # the extrapolated theta interval is in the upper half-circle
-                upper_half_circle = True
-                return int((scaling - 2) / 4), upper_half_circle
+            # Check if the scaled interval fits within the half-circle boundaries
+            if theta_min <= theta_max:
+                if theta_max <= 0.5:
+                    # Interval is within the upper half-circle
+                    return (scaling - 2) // 4, True
+                elif theta_min >= 0.5:
+                    # Interval is within the lower half-circle
+                    return (scaling - 2) // 4, False
 
-            elif theta_max >= 0.5 and theta_max >= theta_min >= 0.5:
-                # the extrapolated theta interval is in the upper half-circle
-                upper_half_circle = False
-                return int((scaling - 2) / 4), upper_half_circle
+            scaling -= decrement
 
-            scaling -= 4
-
-        # if we do not find a feasible k, return the old one
-        return int(k), upper_half_circle
+        return k, upper_half_circle
 
     def construct_circuit(
         self, estimation_problem: EstimationProblem, k: int = 0, measurement: bool = False
@@ -212,20 +213,20 @@ class IterativeAmplitudeEstimation(AmplitudeEstimator):
         )
         circuit = QuantumCircuit(num_qubits, name="circuit")
 
-        # add classical register if needed
-        if measurement:
-            c = ClassicalRegister(len(estimation_problem.objective_qubits))
-            circuit.add_register(c)
-
         # add A operator
         circuit.compose(estimation_problem.state_preparation, inplace=True)
 
         # add Q^k
         if k != 0:
-            circuit.compose(estimation_problem.grover_operator.power(k), inplace=True)
+            for _ in range(k):
+                circuit.compose(estimation_problem.grover_operator, inplace=True)
+        
 
-            # add optional measurement
+        # add optional measurement
         if measurement:
+            # add classical register if needed
+            c = ClassicalRegister(len(estimation_problem.objective_qubits), "c0")
+            circuit.add_register(c)
             # real hardware can currently not handle operations after measurements, which might
             # happen if the circuit gets transpiled, hence we're adding a safeguard-barrier
             circuit.barrier()
@@ -256,12 +257,15 @@ class IterativeAmplitudeEstimation(AmplitudeEstimator):
         return int(one_counts), one_counts / sum(counts_dict.values())
 
     def estimate(
-        self, estimation_problem: EstimationProblem
+        self, estimation_problem: EstimationProblem, show_details = False, bayes = True, n_shots = 10
     ) -> "IterativeAmplitudeEstimationResult":
         """Run the amplitude estimation algorithm on provided estimation problem.
 
         Args:
             estimation_problem: The estimation problem.
+            show_details: True for printing details for each iteration.
+            bayes: True for Bayesian IQAE, False for Jeffreys IQAE
+            n_shots: number of shots for each iteration
 
         Returns:
             An amplitude estimation results object.
@@ -271,79 +275,157 @@ class IterativeAmplitudeEstimation(AmplitudeEstimator):
             AlgorithmError: Sampler job run error.
         """
         if self._sampler is None:
-            warnings.warn("No sampler provided, defaulting to Sampler from qiskit.primitives")
-            self._sampler = Sampler()
+            warnings.warn("No sampler provided, defaulting to SamplerV2 from qiskit_ibm_runtime")
+            from qiskit_aer import AerSimulator
+            self._sampler = SamplerV2(mode = AerSimulator())
 
-        # initialize memory variables
-        powers = [0]  # list of powers k: Q^k, (called 'k' in paper)
-        ratios = []  # list of multiplication factors (called 'q' in paper)
-        theta_intervals = [[0, 1 / 4]]  # a priori knowledge of theta / 2 / pi
-        a_intervals = [[0.0, 1.0]]  # a priori knowledge of the confidence interval of the estimate
-        num_oracle_queries = 0
-        num_one_shots = []
+        # Initialize memory variables
+        powers = [0]  # List of powers k: Q^k (called 'k' in paper)
+        ratios = []  # List of multiplication factors (called 'q' in paper)
+        theta_intervals = [[0, 1/4]]  # A priori knowledge of theta / (2*pi)
+        a_intervals = [[0.0, 1.0]]  # A priori knowledge of the confidence interval of the estimate
+        num_oracle_queries = 0  # Quantum sample complexity
+        num_one_shots = []  # Counts of '1' in each iteration
+        circuit_depths = []  # Circuit depth in each round
+        elapsed_times = []  # Running time of each iteration
 
-        # maximum number of rounds
-        max_rounds = (
-            int(np.log(self._min_ratio * np.pi / 8 / self._epsilon) / np.log(self._min_ratio)) + 1
-        )
-        upper_half_circle = True  # initially theta is in the upper half-circle
+        # Calculate maximum number of rounds
+        max_rounds = int(np.log(self._min_ratio * np.pi / (8 * self._epsilon)) / np.log(self._min_ratio)) + 1
+        if show_details:
+            print(f"Maximum number of rounds: {max_rounds}")
+            print(f"Number of shots taken in each iteration: {n_shots}")
+        
+        # Initialize iteration variables
+        num_iterations = 0
+        num_rounds = 0
+        upper_half_circle = True  # Initially, theta is in the upper half-circle
+        
+        # Set initial prior (Jeffreys prior)
+        prior = [0.5, 0.5]
 
-        num_iterations = 0  # keep track of the number of iterations
+        # Helper function to get the prior distribution of prob(1) for the next round
+        def get_prior(alpha, beta, k_next, k, theta_interval, upper_half_circle, num_samples=1000):
+            """
+            Calculate the prior distribution of prob(1) for the next round
+
+            Args:
+            alpha, beta: Parameters of the posterior Beta distribution of prob(1) at the current round
+            k_next: The number of Grover iterations will be applied in the next round
+            k: The current number of Grover iterations
+            theta_interval: The current interval for theta
+            upper_half_circle: Boolean indicating if the amplified angle is in the upper half-circle
+            num_samples: Number of samples to generate for fitting (default: 1000)
+
+            Returns:
+            A tuple (alpha, beta) representing the parameters of the Beta prior for the next round
+            """
+            # Generate samples from the current posteriorBeta distribution of prob(1)
+            samples = np.random.beta(alpha, beta, num_samples)
+
+            # Define the transformation function from prob(1) at the current round to prob(1) at the next round
+            def f(x, k_next, k, theta_interval, upper_half_circle):
+                """
+                Transform prob(1) from the current stage to the next stage.
+                
+                Args:
+                    x: prob(1) at the current stage
+                    other parameters: See the outer function for details
+                
+                Returns:
+                    prob(1) at the next stage
+                """
+                # Calculate the angle based on whether we're in the upper or lower half-circle
+                angle = np.arccos(1 - 2 * x) / (2 * np.pi) if upper_half_circle else 1 - np.arccos(1 - 2 * x) / (2 * np.pi)
+                scaling = 4 * k + 2  # Calculate the scaling factor based on the current k
+                theta = (int(scaling * theta_interval[0]) + angle) / scaling  # compute theta from the angle
+                return np.sin((2 * k_next + 1) * 2 * np.pi * theta) ** 2  # compute prob(1) for the next round from theta
+
+            # Apply the transformation to all samples
+            transformed_samples = np.vectorize(lambda x: f(x, k_next, k, theta_interval, upper_half_circle))(samples)
+
+            # Fit a new Beta distribution to the transformed data
+            def neg_log_likelihood(params, data):
+                # Compute the negative log-likelihood function for the Beta distribution
+                return -np.sum(stats.beta.logpdf(data, *params))
+
+            # Use optimization to find the best fitting alpha and beta parameters
+            result = minimize(
+                neg_log_likelihood,
+                x0=[1.0, 1.0],  # Initial guess for alpha and beta
+                args=(transformed_samples,),
+                method='L-BFGS-B',
+                bounds=[(0.01, None), (0.01, None)]  # Ensure alpha and beta are positive
+            )
+            return result.x  # Return the optimized alpha and beta parameters for the new Beta distribution
+        
+
+        
         # do while loop, keep in mind that we scaled theta mod 2pi such that it lies in [0,1]
-        while theta_intervals[-1][1] - theta_intervals[-1][0] > self._epsilon / np.pi:
+        while a_intervals[-1][1] - a_intervals[-1][0] > 2 * self._epsilon:
+            if show_details:
+                print("--------------------------------------------------------------------------")
+                print(f"Iteration: {num_iterations}    Round: {num_rounds}")
+                print(f"Current theta interval: {theta_intervals[-1]}")
+            
             num_iterations += 1
-
-            # get the next k
+            
+            
+            # Determine the next k and update upper_half_circle
+            upper_half_circle_pre = upper_half_circle  # Store current upper_half_circle for prior computation
+            if show_details:
+                start_time = time.time()
             k, upper_half_circle = self._find_next_k(
                 powers[-1],
                 upper_half_circle,
                 theta_intervals[-1],  # type: ignore
                 min_ratio=self._min_ratio,
             )
+            if show_details:
+                end_time = time.time()
+                print(f"Found k={k}, running time: {end_time - start_time:.4f} seconds")
+
+            # Update Bayesian prior if necessary
+            if k != powers[-1]:
+                num_rounds += 1
+                if bayes:
+                    if show_details:
+                        start_time = time.time()
+                    prior = get_prior(post[0], post[1], k, powers[-1], theta_intervals[-1], upper_half_circle_pre)
+                    if show_details:
+                        end_time = time.time()
+                        print(f"Update the prior, running time: {end_time - start_time:.4f} seconds")
 
             # store the variables
             powers.append(k)
-            ratios.append((2 * powers[-1] + 1) / (2 * powers[-2] + 1))
+            ratios.append((2 * k + 1) / (2 * powers[-2] + 1))
 
             # run measurements for Q^k A|0> circuit
+            # construct the circuit
+            if show_details:
+                start_time = time.time()
             circuit = self.construct_circuit(estimation_problem, k, measurement=True)
-            counts = {}
+            circuit_depths.append(circuit.depth())
+            if show_details:
+                print(f"Circuit constructed with {k} Q operators. Depth: {circuit_depths[-1]}. Construction time: {time.time() - start_time:.4f} seconds")
+
+            # Run the circuit
+            if show_details:
+                start_time = time.time()
 
             try:
-                job = self._sampler.run([circuit])
+                job = self._sampler.run([circuit], shots = n_shots)
                 ret = job.result()
+                if show_details:
+                    end_time = time.time()
+                    elapsed_time = end_time - start_time
+                    elapsed_times.append(elapsed_time)
+                    print(f"Sample {n_shots} shots, running time: {elapsed_time:.2f} seconds")
             except Exception as exc:
-                raise AlgorithmError("The job was not completed successfully. ") from exc
+                raise AlgorithmError("The job was not completed successfully.") from exc
 
-            shots = ret.metadata[0].get("shots")
-            if shots is None:
-                circuit = self.construct_circuit(estimation_problem, k=0, measurement=True)
-                try:
-                    job = self._sampler.run([circuit])
-                    ret = job.result()
-                except Exception as exc:
-                    raise AlgorithmError("The job was not completed successfully. ") from exc
-
-                # calculate the probability of measuring '1'
-                prob = 0.0
-                for bit, probabilities in ret.quasi_dists[0].binary_probabilities().items():
-                    # check if it is a good state
-                    if estimation_problem.is_good_state(bit):
-                        prob += probabilities
-
-                a_confidence_interval = [prob, prob]
-                a_intervals.append(a_confidence_interval)
-
-                theta_i_interval = [
-                    np.arccos(1 - 2 * a_i) / 2 / np.pi for a_i in a_confidence_interval
-                ]
-                theta_intervals.append(theta_i_interval)
-                num_oracle_queries = 0  # no Q-oracle call, only a single one to A
-                break
-
-            counts = {
-                k: round(v * shots) for k, v in ret.quasi_dists[0].binary_probabilities().items()
-            }
+            
+            # Extract shots and counts from `ret`
+            counts = ret[0].data.c0.get_counts()
 
             # calculate the probability of measuring '1', 'prob' is a_i in the paper
             one_counts, prob = self._good_state_probability(estimation_problem, counts)
@@ -351,29 +433,28 @@ class IterativeAmplitudeEstimation(AmplitudeEstimator):
             num_one_shots.append(one_counts)
 
             # track number of Q-oracle calls
-            num_oracle_queries += shots * k
+            num_oracle_queries += n_shots * k
+            if show_details: 
+                print(f"Accumulated quantum sample complexity: {num_oracle_queries}")
 
             # if on the previous iterations we have K_{i-1} == K_i, we sum these samples up
             j = 1  # number of times we stayed fixed at the same K
-            round_shots = shots
+            round_shots = n_shots
             round_one_counts = one_counts
             if num_iterations > 1:
-                while (
-                    powers[num_iterations - j] == powers[num_iterations] and num_iterations >= j + 1
-                ):
-                    j = j + 1
-                    round_shots += shots
+                while num_iterations >= j + 1 and powers[num_iterations - j] == powers[num_iterations]:
+                    j += 1
+                    round_shots += n_shots
                     round_one_counts += num_one_shots[-j]
 
             # compute a_min_i, a_max_i
             if self._confint_method == "chernoff":
                 a_i_min, a_i_max = _chernoff_confint(prob, round_shots, max_rounds, self._alpha)
             else:  # 'beta'
-                a_i_min, a_i_max = _clopper_pearson_confint(
-                    round_one_counts, round_shots, self._alpha / max_rounds
-                )
+                post = round_one_counts + prior[0], round_shots - round_one_counts + prior[1]
+                a_i_min, a_i_max = _jeffreys_confint(self._alpha / max_rounds, post = post)
 
-            # compute theta_min_i, theta_max_i
+            # compute theta_min_i, theta_max_i for the angle, not theta
             if upper_half_circle:
                 theta_min_i = np.arccos(1 - 2 * a_i_min) / 2 / np.pi
                 theta_max_i = np.arccos(1 - 2 * a_i_max) / 2 / np.pi
@@ -381,9 +462,9 @@ class IterativeAmplitudeEstimation(AmplitudeEstimator):
                 theta_min_i = 1 - np.arccos(1 - 2 * a_i_max) / 2 / np.pi
                 theta_max_i = 1 - np.arccos(1 - 2 * a_i_min) / 2 / np.pi
 
-            # compute theta_u, theta_l of this iteration
+            # compute theta_u, theta_l of this iteration by adding the base to the angle and scaling
             scaling = 4 * k + 2  # current K_i factor
-            theta_u = (int(scaling * theta_intervals[-1][1]) + theta_max_i) / scaling
+            theta_u = (int(scaling * theta_intervals[-1][0]) + theta_max_i) / scaling
             theta_l = (int(scaling * theta_intervals[-1][0]) + theta_min_i) / scaling
             theta_intervals.append([theta_l, theta_u])
 
@@ -394,12 +475,17 @@ class IterativeAmplitudeEstimation(AmplitudeEstimator):
             a_l = cast(float, a_l)
             a_intervals.append([a_l, a_u])
 
+
+            
+
         # get the latest confidence interval for the estimate of a
         confidence_interval = cast(Tuple[float, float], a_intervals[-1])
 
         # the final estimate is the mean of the confidence interval
         estimation = np.mean(confidence_interval)
 
+        
+        # Construct the result object   
         result = IterativeAmplitudeEstimationResult()
         result.alpha = self._alpha
         result.post_processing = cast(Callable[[float], float], estimation_problem.post_processing)
@@ -421,8 +507,11 @@ class IterativeAmplitudeEstimation(AmplitudeEstimator):
         result.epsilon_estimated_processed = (confidence_interval[1] - confidence_interval[0]) / 2
         result.estimate_intervals = a_intervals
         result.theta_intervals = theta_intervals
-        result.powers = powers
+        result.powers = powers[1:]
         result.ratios = ratios
+
+        result.circuit_depths = circuit_depths
+        result.elapsed_times = elapsed_times  
 
         return result
 
@@ -441,6 +530,8 @@ class IterativeAmplitudeEstimationResult(AmplitudeEstimatorResult):
         self._powers: list[int] | None = None
         self._ratios: list[float] | None = None
         self._confidence_interval_processed: tuple[float, float] | None = None
+        self._circuit_depths: list[int] | None = None
+        self._elapsed_times: list[float] | None = None
 
     @property
     def alpha(self) -> float:
@@ -532,6 +623,26 @@ class IterativeAmplitudeEstimationResult(AmplitudeEstimatorResult):
         """Set the post-processed confidence interval."""
         self._confidence_interval_processed = value
 
+    @property
+    def circuit_depths(self) -> list[int]:
+        """Return the circuit depths for each iteration."""
+        return self._circuit_depths
+
+    @circuit_depths.setter
+    def circuit_depths(self, value: list[int]) -> None:
+        """Set the circuit depths for each iteration."""
+        self._circuit_depths = value
+
+    @property
+    def elapsed_times(self) -> list[float]:
+        """Return the elapsed times for each iteration."""
+        return self._elapsed_times
+
+    @elapsed_times.setter
+    def elapsed_times(self, value: list[float]) -> None:
+        """Set the elapsed times for each iteration."""
+        self._elapsed_times = value
+
 
 def _chernoff_confint(
     value: float, shots: int, max_rounds: int, alpha: float
@@ -559,25 +670,22 @@ def _chernoff_confint(
     return lower, upper
 
 
-def _clopper_pearson_confint(counts: int, shots: int, alpha: float) -> tuple[float, float]:
-    """Compute the Clopper-Pearson confidence interval for `shots` i.i.d. Bernoulli trials.
+def _jeffreys_confint(alpha: float, post: tuple[float, float]) -> tuple[float, float]:
+    """Compute the Jeffreys confidence interval for `shots` i.i.d. Bernoulli trials.
 
     Args:
-        counts: The number of positive counts.
-        shots: The number of shots.
         alpha: The confidence level for the confidence interval.
+        post: A tuple containing the parameters of the posterior Beta distribution.
 
     Returns:
-        The Clopper-Pearson confidence interval.
+        The Jeffreys confidence interval.
     """
     lower, upper = 0, 1
 
     # if counts == 0, the beta quantile returns nan
-    if counts != 0:
-        lower = beta.ppf(alpha / 2, counts, shots - counts + 1)
+    lower = beta.ppf(alpha / 2, post[0], post[1])
 
     # if counts == shots, the beta quantile returns nan
-    if counts != shots:
-        upper = beta.ppf(1 - alpha / 2, counts + 1, shots - counts)
+    upper = beta.ppf(1 - alpha / 2, post[0], post[1])
 
     return lower, upper
