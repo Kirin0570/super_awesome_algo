@@ -48,7 +48,7 @@ setuptools.setup(
     description="Qiskit Algorithms: A library of quantum computing algorithms",
     long_description=README,
     long_description_content_type="text/markdown",
-    url="https://github.com/qiskit-community/qiskit-algorithms",
+    url="https://github.com/Kirin0570/super_awesome_algo",
     author="Qiskit Algorithms Development Team",
     author_email="qiskit@us.ibm.com",
     license="Apache-2.0",
