@@ -218,8 +218,9 @@ class IterativeAmplitudeEstimation(AmplitudeEstimator):
 
         # add Q^k
         if k != 0:
-            for _ in range(k):
-                circuit.compose(estimation_problem.grover_operator, inplace=True)
+            #for _ in range(k):
+            #    circuit.compose(estimation_problem.grover_operator, inplace=True)
+            circuit.compose(estimation_problem.grover_operator.power(k).decompose(), inplace=True)
         
 
         # add optional measurement
